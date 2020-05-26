@@ -1,12 +1,18 @@
 package main
+
 import (
-	"fmt"
-	"os"
-	"log"
-	"runtime/trace"
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"runtime/trace"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
+
 type (
 	Bean       int
 	GroundBean int
@@ -63,7 +69,7 @@ func (cups Coffee) GroundBeans() GroundBean {
 	return GroundBean(20*cups) / GramGroundBeans
 }
 
-func main(){
+func main() {
 	f, err := os.Create("trace.out")
 	if err != nil {
 		log.Fatalln("Error:", err)
@@ -84,11 +90,9 @@ func main(){
 
 func _main() {
 	// 作るコーヒーの数
-	done1 := make(chan bool)
-	done2 := make(chan bool)
 	const amountCoffee = 20 * CupsCoffee
 
-	ctx, task := trace.NewTask(context.Background(), "make coffee")
+	taskCtx, task := trace.NewTask(context.Background(), "make coffe")
 	defer task.End()
 
 	// 材料
@@ -98,65 +102,134 @@ func _main() {
 	fmt.Println(water)
 	fmt.Println(beans)
 
+	eg, ctx := errgroup.WithContext(taskCtx)
+
 	// お湯を沸かす
 	var hotWater HotWater
-	go func(){
-		for water > 0 {
-			water -= 600 * MilliLiterWater
-			hotWater += boil(ctx, 600*MilliLiterWater)
-		}
-		done1<-true
-	}()
-	fmt.Println(hotWater)
+	var hwmu sync.Mutex
+	for water > 0 {
+		water -= 600 * MilliLiterWater
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				trace.Log(ctx, "boil error", ctx.Err().Error())
+				return ctx.Err()
+			default:
+			}
+			hw, err := boil(ctx, 600*MilliLiterWater)
+			if err != nil {
+				return err
+			}
+			hwmu.Lock()
+			defer hwmu.Unlock()
+			hotWater += hw
+			return nil
+		})
+	}
 
 	// 豆を挽く
 	var groundBeans GroundBean
-	go func(){
+	var gbmu sync.Mutex
 	for beans > 0 {
 		beans -= 20 * GramBeans
-		groundBeans += grind(ctx, 20*GramBeans)
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				trace.Log(ctx, "grind error", ctx.Err().Error())
+				return ctx.Err()
+			default:
+			}
+
+			gb, err := grind(ctx, 20*GramBeans)
+			if err != nil {
+				return err
+			}
+			gbmu.Lock()
+			defer gbmu.Unlock()
+			groundBeans += gb
+			return nil
+		})
 	}
-	done2<-true
-	}()
+
+	if err := eg.Wait(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return
+	}
+	fmt.Println(hotWater)
 	fmt.Println(groundBeans)
 
 	// コーヒーを淹れる
-	<-done1
-	<-done2
+	eg, ctx = errgroup.WithContext(taskCtx)
 	var coffee Coffee
+	var cfmu sync.Mutex
 	cups := 4 * CupsCoffee
 	for hotWater >= cups.HotWater() && groundBeans >= cups.GroundBeans() {
 		hotWater -= cups.HotWater()
 		groundBeans -= cups.GroundBeans()
-		coffee += brew(ctx, cups.HotWater(), cups.GroundBeans())
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				trace.Log(ctx, "brew error", ctx.Err().Error())
+				return ctx.Err()
+			default:
+			}
+
+			cf, err := brew(ctx, cups.HotWater(), cups.GroundBeans())
+			if err != nil {
+				return err
+			}
+			cfmu.Lock()
+			defer cfmu.Unlock()
+			coffee += cf
+			return nil
+		})
 	}
 
+	if err := eg.Wait(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return
+	}
 	fmt.Println(coffee)
 }
 
 // お湯を沸かす
-func boil(ctx context.Context, water Water) HotWater {
+func boil(ctx context.Context, water Water) (HotWater, error) {
 	defer trace.StartRegion(ctx, "boil").End()
+	if water > 600*MilliLiterWater {
+		return 0, errors.New("1度に沸かすことのできるお湯は600[ml]までです")
+	}
 	time.Sleep(400 * time.Millisecond)
-	return HotWater(water)
+	return HotWater(water), nil
 }
 
 // コーヒー豆を挽く
-func grind(ctx context.Context, beans Bean) GroundBean {
+func grind(ctx context.Context, beans Bean) (GroundBean, error) {
 	defer trace.StartRegion(ctx, "grind").End()
+	if beans > 20*GramBeans {
+		return 0, errors.New("1度に挽くことのできる豆は20[g]までです")
+	}
 	time.Sleep(200 * time.Millisecond)
-	return GroundBean(beans)
+	return GroundBean(beans), nil
 }
 
 // コーヒーを淹れる
-func brew(ctx context.Context, hotWater HotWater, groundBeans GroundBean) Coffee {
+func brew(ctx context.Context, hotWater HotWater, groundBeans GroundBean) (Coffee, error) {
 	defer trace.StartRegion(ctx, "brew").End()
+
+	if hotWater < (1 * CupsCoffee).HotWater() {
+		return 0, errors.New("お湯が足りません")
+	}
+
+	if groundBeans < (1 * CupsCoffee).GroundBeans() {
+		return 0, errors.New("粉が足りません")
+	}
+
 	time.Sleep(1 * time.Second)
 	// 少ない方を優先する
 	cups1 := Coffee(hotWater / (1 * CupsCoffee).HotWater())
 	cups2 := Coffee(groundBeans / (1 * CupsCoffee).GroundBeans())
 	if cups1 < cups2 {
-		return cups1
+		return cups1, nil
 	}
-	return cups2
+	return cups2, nil
 }
